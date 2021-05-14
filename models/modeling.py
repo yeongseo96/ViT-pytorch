@@ -16,6 +16,7 @@ import numpy as np
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
 from torch.nn.modules.utils import _pair
 from scipy import ndimage
+import torch.nn.functional as F
 
 import models.configs as configs
 
@@ -260,7 +261,7 @@ class Transformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False, loss_mode="ce"):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -268,15 +269,36 @@ class VisionTransformer(nn.Module):
 
         self.transformer = Transformer(config, img_size, vis)
         self.head = Linear(config.hidden_size, num_classes)
+        self.loss_mode = loss_mode
 
     def forward(self, x, labels=None):
         x, attn_weights = self.transformer(x)
         logits = self.head(x[:, 0])
 
         if labels is not None:
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
-            return loss
+            if self.loss_mode=="als":
+                lprobs = F.log_softmax(logits, dim=-1)
+                lprobs_target = lprobs.gather(dim=-1, index=labels.unsqueeze(-1))
+                with torch.no_grad():
+                    probs = F.softmax(logits, dim=-1)
+                    entropy = torch.sum(probs*lprobs, dim=-1)
+                    eps = (entropy).exp()
+                eps_i = eps/(lprobs.size(-1)-1)
+                nll_loss = -(lprobs_target*(1-eps-eps_i)).mean()
+                smoothed_loss = -((eps_i * lprobs.sum(dim=-1))).mean()
+                loss = nll_loss + smoothed_loss
+            elif self.loss_mode=="ls":
+                lprobs = F.log_softmax(logits, dim=-1)
+                lprobs_target = lprobs.gather(dim=-1, index=labels.unsqueeze(-1))
+                eps = 0.1
+                eps_i = eps/(lprobs.size(-1)-1)
+                nll_loss = -(lprobs_target*(1-eps-eps_i)).mean()
+                smoothed_loss = -((eps_i * lprobs.sum(dim=-1))).mean()
+                loss = nll_loss + smoothed_loss
+            else:
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+            return loss 
         else:
             return logits, attn_weights
 
